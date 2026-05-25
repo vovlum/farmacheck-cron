@@ -1,5 +1,4 @@
 import os, re, json, csv, time, requests
-from supabase import create_client
 from datetime import datetime, timezone
 
 # ── Credenciales ──────────────────────────────────────────────────────────────
@@ -8,16 +7,35 @@ SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+SB_HEADERS = {
+    "apikey":        SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type":  "application/json",
+    "Prefer":        "return=minimal",
+}
+
+# ── Supabase REST ─────────────────────────────────────────────────────────────
+def sb_get(table, params=""):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=SB_HEADERS)
+    return r.json()
+
+def sb_upsert(table, data):
+    h = {**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"}
+    requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=h, json=data)
+
+def sb_insert(table, data):
+    requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, json=data)
+
+def get_snapshot(certificado):
+    rows = sb_get("medicamentos", f"certificado=eq.{certificado}&select=*")
+    return rows[0] if rows else None
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def telegram_send(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, data={
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       text,
-        "parse_mode": "HTML"
-    })
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    )
 
 # ── VNM Scraper ───────────────────────────────────────────────────────────────
 BASE  = "https://servicios.pami.org.ar/vademecum"
@@ -104,23 +122,6 @@ def extraer_detalle(session, dtid, sid, btn_num):
     resultado["retiro_count"] = int(m.group(1)) if m else 0
     return resultado, sid+1
 
-# ── Supabase ──────────────────────────────────────────────────────────────────
-def get_snapshot(certificado):
-    res = supabase.table("medicamentos").select("*").eq("certificado", certificado).execute()
-    return res.data[0] if res.data else None
-
-def upsert_snapshot(data):
-    supabase.table("medicamentos").upsert(data).execute()
-
-def insertar_alerta(certificado, nombre, campo, anterior, nuevo):
-    supabase.table("alertas").insert({
-        "certificado":      certificado,
-        "nombre_comercial": nombre,
-        "campo":            campo,
-        "valor_anterior":   anterior,
-        "valor_nuevo":      nuevo,
-    }).execute()
-
 # ── Detección de cambios ──────────────────────────────────────────────────────
 CAMPOS_MONITOREADOS = ["estado", "disponibilidad", "condicion_expendio", "retiro_count"]
 EMOJIS = {
@@ -130,27 +131,32 @@ EMOJIS = {
     "condicion_expendio": "🟡",
 }
 
-def detectar_cambios(certificado, nombre, snapshot_anterior, datos_nuevos):
-    if not snapshot_anterior:
-        return  # primer registro, sin alerta
+def detectar_cambios(certificado, nombre, snap_ant, datos_nuevos):
+    if not snap_ant:
+        return
     cambios = []
     for campo in CAMPOS_MONITOREADOS:
-        anterior = str(snapshot_anterior.get(campo, ""))
+        anterior = str(snap_ant.get(campo, ""))
         nuevo    = str(datos_nuevos.get(campo, ""))
         if anterior != nuevo:
             cambios.append((campo, anterior, nuevo))
-            insertar_alerta(certificado, nombre, campo, anterior, nuevo)
+            sb_insert("alertas", {
+                "certificado":      certificado,
+                "nombre_comercial": nombre,
+                "campo":            campo,
+                "valor_anterior":   anterior,
+                "valor_nuevo":      nuevo,
+            })
     if cambios:
         emoji = EMOJIS.get(cambios[0][0], "🔔")
-        lineas = [f"{emoji} <b>ALERTA FarmaCheck</b>"]
-        lineas.append(f"💊 <b>{nombre}</b> (cert. {certificado})")
-        lineas.append("")
+        lineas = [f"{emoji} <b>ALERTA FarmaCheck</b>",
+                  f"💊 <b>{nombre}</b> (cert. {certificado})", ""]
         for campo, anterior, nuevo in cambios:
-            lineas.append(f"<b>{campo.upper()}</b>")
-            lineas.append(f"  Antes: {anterior or '(vacío)'}")
-            lineas.append(f"  Ahora: {nuevo or '(vacío)'}")
+            lineas += [f"<b>{campo.upper()}</b>",
+                       f"  Antes: {anterior or '(vacío)'}",
+                       f"  Ahora: {nuevo or '(vacío)'}"]
         telegram_send("\n".join(lineas))
-        print(f"  ⚠️  ALERTA enviada: {nombre} — {[c[0] for c in cambios]}")
+        print(f"  ⚠️  ALERTA: {nombre} — {[c[0] for c in cambios]}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -163,13 +169,12 @@ def main():
     with open("semilla.csv") as f:
         semilla = list(csv.DictReader(f))
 
-    ok, errores, alertas = 0, 0, 0
+    ok, errores = 0, 0
     for i, row in enumerate(semilla):
-        cert  = row["certificado"].strip()
+        cert   = row["certificado"].strip()
         nombre = row["nombre_comercial"].strip()
         print(f"[{i+1:02d}/{len(semilla)}] {nombre:<35}", end=" ", flush=True)
         try:
-            # Renovar sesión cada 30 requests
             if sid > 90:
                 session, dtid, sid = init_session()
                 time.sleep(0.5)
@@ -185,7 +190,7 @@ def main():
             detalle, sid = extraer_detalle(session, dtid, sid, fila["btn_ver"])
             time.sleep(0.4)
 
-            snapshot_anterior = get_snapshot(cert)
+            snap_ant   = get_snapshot(cert)
             datos_nuevos = {
                 "certificado":      cert,
                 "nombre_comercial": fila["nombre_comercial"],
@@ -193,10 +198,11 @@ def main():
                 "generico":         fila["generico"],
                 "gtin":             fila["gtin"],
                 **detalle,
-                "updated_at":       datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            detectar_cambios(cert, nombre, snapshot_anterior, datos_nuevos)
-            upsert_snapshot(datos_nuevos)
+            detectar_cambios(cert, nombre, snap_ant, datos_nuevos)
+            sb_upsert("medicamentos", datos_nuevos)
+
             estado = detalle.get("estado", "?")
             disp   = "⚠️ ALERTA" if detalle.get("disponibilidad") else "ok"
             print(f"{estado} — {disp}")
@@ -210,13 +216,12 @@ def main():
             except:
                 pass
 
-    resumen = (
+    telegram_send(
         f"✅ <b>FarmaCheck cron completado</b>\n"
-        f"📊 {ok} ok | {errores} errores | {alertas} alertas\n"
+        f"📊 {ok} ok | {errores} errores\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
-    telegram_send(resumen)
-    print(f"\n{ok} ok | {errores} errores")
+    print(f"\n✅ {ok} ok | {errores} errores")
 
 if __name__ == "__main__":
     main()
