@@ -21,7 +21,9 @@ def sb_get(table, params=""):
 
 def sb_upsert(table, data):
     h = {**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"}
-    requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=h, json=data)
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=h, json=data)
+    if r.status_code not in (200, 201, 204):
+        print(f"  SUPABASE ERROR {r.status_code}: {r.text[:200]}")
 
 def sb_insert(table, data):
     requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, json=data)
